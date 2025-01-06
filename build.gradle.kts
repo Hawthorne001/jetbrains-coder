@@ -9,34 +9,33 @@ plugins {
     // Groovy support
     id("groovy")
     // Kotlin support
-    id("org.jetbrains.kotlin.jvm") version "1.9.22"
+    id("org.jetbrains.kotlin.jvm") version "1.9.23"
     // Gradle IntelliJ Plugin
     id("org.jetbrains.intellij") version "1.13.3"
     // Gradle Changelog Plugin
-    id("org.jetbrains.changelog") version "2.2.0"
+    id("org.jetbrains.changelog") version "2.2.1"
     // Gradle Qodana Plugin
     id("org.jetbrains.qodana") version "0.1.13"
+    // Generate Moshi adapters.
+    id("com.google.devtools.ksp") version "1.9.23-1.0.20"
 }
 
 group = properties("pluginGroup")
 version = properties("pluginVersion")
 
 dependencies {
-    implementation("com.squareup.retrofit2:retrofit:2.9.0")
-    // define a BOM and its version
     implementation(platform("com.squareup.okhttp3:okhttp-bom:4.12.0"))
-    implementation("com.squareup.retrofit2:converter-gson:2.9.0")
     implementation("com.squareup.okhttp3:okhttp")
     implementation("com.squareup.okhttp3:logging-interceptor")
 
-    implementation("org.zeroturnaround:zt-exec:1.12") {
-        exclude("org.slf4j")
-    }
+    implementation("com.squareup.moshi:moshi:1.15.1")
+    ksp("com.squareup.moshi:moshi-kotlin-codegen:1.15.1")
 
-    testImplementation(platform("org.apache.groovy:groovy-bom:4.0.17"))
-    testImplementation("org.apache.groovy:groovy")
-    testImplementation(platform("org.spockframework:spock-bom:2.3-groovy-4.0"))
-    testImplementation("org.spockframework:spock-core")
+    implementation("com.squareup.retrofit2:retrofit:2.11.0")
+    implementation("com.squareup.retrofit2:converter-moshi:2.11.0")
+
+    implementation("org.zeroturnaround:zt-exec:1.12")
+
     testImplementation(kotlin("test"))
 }
 
@@ -119,15 +118,17 @@ tasks {
                     throw GradleException("Plugin description section not found in README.md:\n$start ... $end")
                 }
                 subList(indexOf(start) + 1, indexOf(end))
-            }.joinToString("\n").run { markdownToHTML(this) }
+            }.joinToString("\n").run { markdownToHTML(this) },
         )
 
         // Get the latest available change notes from the changelog file
-        changeNotes.set(provider {
-            changelog.run {
-                getOrNull(properties("pluginVersion")) ?: getLatest()
-            }.toHTML()
-        })
+        changeNotes.set(
+            provider {
+                changelog.run {
+                    getOrNull(properties("pluginVersion")) ?: getLatest()
+                }.toHTML()
+            },
+        )
     }
 
     runIde {

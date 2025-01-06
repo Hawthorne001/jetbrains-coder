@@ -5,20 +5,26 @@ package com.coder.gateway.views
 import com.coder.gateway.CoderGatewayBundle
 import com.coder.gateway.CoderGatewayConstants
 import com.coder.gateway.CoderRemoteConnectionHandle
+import com.coder.gateway.cli.CoderCLIManager
+import com.coder.gateway.cli.ensureCLI
 import com.coder.gateway.icons.CoderIcons
-import com.coder.gateway.models.RecentWorkspaceConnection
 import com.coder.gateway.models.WorkspaceAgentListModel
-import com.coder.gateway.sdk.BaseCoderRestClient
+import com.coder.gateway.models.WorkspaceProjectIDE
+import com.coder.gateway.models.toWorkspaceProjectIDE
 import com.coder.gateway.sdk.CoderRestClient
 import com.coder.gateway.sdk.v2.models.WorkspaceStatus
 import com.coder.gateway.sdk.v2.models.toAgentList
 import com.coder.gateway.services.CoderRecentWorkspaceConnectionsService
-import com.coder.gateway.toWorkspaceParams
+import com.coder.gateway.services.CoderRestClientService
+import com.coder.gateway.services.CoderSettingsService
+import com.coder.gateway.util.humanizeConnectionError
 import com.coder.gateway.util.toURL
+import com.coder.gateway.util.withoutNull
 import com.intellij.icons.AllIcons
-import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.application.asContextElement
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.DumbAwareAction
@@ -41,7 +47,6 @@ import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import com.jetbrains.gateway.api.GatewayRecentConnections
 import com.jetbrains.gateway.api.GatewayUI
-import com.jetbrains.gateway.ssh.IntelliJPlatformProduct
 import com.jetbrains.rd.util.lifetime.Lifetime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -51,12 +56,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.awt.Color
 import java.awt.Component
 import java.awt.Dimension
-import java.nio.file.Path
-import java.util.*
+import java.util.Locale
+import java.util.UUID
 import javax.swing.JComponent
-import javax.swing.JLabel
 import javax.swing.event.DocumentEvent
 
 /**
@@ -64,17 +69,23 @@ import javax.swing.event.DocumentEvent
  * along with the latest workspace responses.
  */
 data class DeploymentInfo(
-    // Null if unable to create the client (config directory did not exist).
-    var client: BaseCoderRestClient? = null,
+    // Null if unable to create the client.
+    var client: CoderRestClient? = null,
     // Null if we have not fetched workspaces yet.
     var items: List<WorkspaceAgentListModel>? = null,
     // Null if there have not been any errors yet.
     var error: String? = null,
+    // Null if unable to ensure the CLI is downloaded.
+    var cli: CoderCLIManager? = null,
 )
 
-class CoderGatewayRecentWorkspaceConnectionsView(private val setContentCallback: (Component) -> Unit) : GatewayRecentConnections, Disposable {
+class CoderGatewayRecentWorkspaceConnectionsView(private val setContentCallback: (Component) -> Unit) :
+    GatewayRecentConnections,
+    Disposable {
+    private val settings = service<CoderSettingsService>()
     private val recentConnectionsService = service<CoderRecentWorkspaceConnectionsService>()
     private val cs = CoroutineScope(Dispatchers.Main)
+    private val jobs: MutableMap<UUID, Job> = mutableMapOf()
 
     private val recentWorkspacesContentPanel = JBScrollPane()
 
@@ -89,201 +100,247 @@ class CoderGatewayRecentWorkspaceConnectionsView(private val setContentCallback:
      * API clients and workspaces grouped by deployment and keyed by their
      * config directory.
      */
-    private var deployments: Map<String, DeploymentInfo> = emptyMap()
+    private var deployments: MutableMap<String, DeploymentInfo> = mutableMapOf()
     private var poller: Job? = null
 
-    override fun createRecentsView(lifetime: Lifetime): JComponent {
-        return panel {
-            indent {
-                row {
-                    label(CoderGatewayBundle.message("gateway.connector.recent-connections.title")).applyToComponent {
-                        font = JBFont.h3().asBold()
-                    }
-                    panel {
-                        indent {
-                            row {
-                                cell(JLabel()).resizableColumn().align(AlignX.FILL)
-                                searchBar = cell(SearchTextField(false)).resizableColumn().align(AlignX.FILL).applyToComponent {
-                                    minimumSize = Dimension(350, -1)
-                                    textEditor.border = JBUI.Borders.empty(2, 5, 2, 0)
-                                    addDocumentListener(object : DocumentAdapter() {
-                                        override fun textChanged(e: DocumentEvent) {
-                                            filterString = this@applyToComponent.text.trim()
-                                            updateContentView()
-                                        }
-                                    })
-                                }.component
-
-                                actionButton(
-                                    object : DumbAwareAction(CoderGatewayBundle.message("gateway.connector.recent-connections.new.wizard.button.tooltip"), null, AllIcons.General.Add) {
-                                        override fun actionPerformed(e: AnActionEvent) {
-                                            setContentCallback(CoderGatewayConnectorWizardWrapperView().component)
-                                        }
-                                    },
-                                ).gap(RightGap.SMALL)
-                            }
-                        }
-                    }
-                }.bottomGap(BottomGap.MEDIUM)
-                separator(background = WelcomeScreenUIManager.getSeparatorColor())
-                row {
-                    resizableRow()
-                    cell(recentWorkspacesContentPanel).resizableColumn().align(AlignX.FILL).align(AlignY.FILL).component
+    override fun createRecentsView(lifetime: Lifetime): JComponent = panel {
+        indent {
+            row {
+                label(CoderGatewayBundle.message("gateway.connector.recent-connections.title")).applyToComponent {
+                    font = JBFont.h3().asBold()
                 }
+                searchBar =
+                    cell(SearchTextField(false)).resizableColumn().align(AlignX.FILL).applyToComponent {
+                        minimumSize = Dimension(350, -1)
+                        textEditor.border = JBUI.Borders.empty(2, 5, 2, 0)
+                        addDocumentListener(
+                            object : DocumentAdapter() {
+                                override fun textChanged(e: DocumentEvent) {
+                                    filterString = this@applyToComponent.text.trim()
+                                    updateContentView()
+                                }
+                            },
+                        )
+                    }.component
+                actionButton(
+                    object : DumbAwareAction(
+                        CoderGatewayBundle.message("gateway.connector.recent-connections.new.wizard.button.tooltip"),
+                        null,
+                        AllIcons.General.Add,
+                    ) {
+                        override fun actionPerformed(e: AnActionEvent) {
+                            setContentCallback(CoderGatewayConnectorWizardWrapperView().component)
+                        }
+                    },
+                ).gap(RightGap.SMALL)
+            }.bottomGap(BottomGap.SMALL)
+            separator(background = WelcomeScreenUIManager.getSeparatorColor())
+            row {
+                resizableRow()
+                cell(recentWorkspacesContentPanel).resizableColumn().align(AlignX.FILL).align(AlignY.FILL).component
             }
-        }.apply {
-            background = WelcomeScreenUIManager.getMainAssociatedComponentBackground()
-            border = JBUI.Borders.empty(12, 0, 0, 12)
         }
+    }.apply {
+        background = WelcomeScreenUIManager.getMainAssociatedComponentBackground()
+        border = JBUI.Borders.empty(12, 0, 0, 12)
     }
 
     override fun getRecentsTitle() = CoderGatewayBundle.message("gateway.connector.title")
 
     override fun updateRecentView() {
-        triggerWorkspacePolling()
+        // Render immediately so we can display spinners for each connection
+        // that we have not fetched a workspace for yet.
         updateContentView()
+        // After each poll, the content view will be updated again.
+        triggerWorkspacePolling()
     }
 
+    /**
+     * Render the most recent connections, matching with fetched workspaces.
+     */
     private fun updateContentView() {
-        val connections = recentConnectionsService.getAllRecentConnections()
-            .filter { it.coderWorkspaceHostname != null }
-            .filter { matchesFilter(it) }
-            .groupBy { it.coderWorkspaceHostname!! }
-        recentWorkspacesContentPanel.viewport.view = panel {
-            connections.forEach { (hostname, connections) ->
-                // The config directory and name will not exist on connections
-                // made with 2.3.0 and earlier.
-                val name = connections.firstNotNullOfOrNull { it.name }
-                val workspaceName = name?.split(".", limit = 2)?.first()
-                val configDirectory = connections.firstNotNullOfOrNull { it.configDirectory }
-                val deployment = deployments[configDirectory]
-                val item = deployment?.items
-                    ?.firstOrNull { it.name == name || it.workspace.name == workspaceName  }
-                row {
-                    (if (item != null) {
-                        icon(item.status.icon).applyToComponent {
-                            foreground = item.status.statusColor()
-                            toolTipText = item.status.description
+        var top = true
+        val connectionsByDeployment = getConnectionsByDeployment(true)
+        recentWorkspacesContentPanel.viewport.view =
+            panel {
+                connectionsByDeployment.forEach { (deploymentURL, connectionsByWorkspace) ->
+                    var first = true
+                    val deployment = deployments[deploymentURL]
+                    val deploymentError = deployment?.error
+                    connectionsByWorkspace.forEach { (workspaceName, connections) ->
+                        // Show the error at the top of each deployment list.
+                        val showError = if (first) {
+                            first = false
+                            true
+                        } else {
+                            false
                         }
-                    } else if (configDirectory == null || workspaceName == null) {
-                        icon(CoderIcons.UNKNOWN).applyToComponent {
-                            toolTipText = "Unable to determine workspace status because the configuration directory and/or name were not recorded. To fix, add the connection again."
+                        val me = deployment?.client?.me?.username
+                        val workspaceWithAgent = deployment?.items?.firstOrNull {
+                            it.workspace.ownerName + "/" + it.workspace.name == workspaceName ||
+                                (it.workspace.ownerName == me && it.workspace.name == workspaceName)
                         }
-                    } else if (deployment?.error != null) {
-                        icon(UIUtil.getBalloonErrorIcon()).applyToComponent {
-                            toolTipText = deployment.error
-                        }
-                    } else if (deployment?.items != null) {
-                        icon(UIUtil.getBalloonErrorIcon()).applyToComponent {
-                            toolTipText = "Workspace $workspaceName does not exist"
-                        }
-                    } else {
-                        icon(AnimatedIcon.Default.INSTANCE).applyToComponent {
-                            toolTipText = "Querying workspace status..."
-                        }
-                    }).align(AlignX.LEFT).gap(RightGap.SMALL).applyToComponent {
-                        size = Dimension(JBUI.scale(16), JBUI.scale(16))
-                    }
-                    label(hostname.removePrefix("coder-jetbrains--")).applyToComponent {
-                        font = JBFont.h3().asBold()
-                    }.align(AlignX.LEFT).gap(RightGap.SMALL)
-                    label("").resizableColumn().align(AlignX.FILL)
-                    actionButton(object : DumbAwareAction(CoderGatewayBundle.message("gateway.connector.recent-connections.start.button.tooltip"), "", CoderIcons.RUN) {
-                        override fun actionPerformed(e: AnActionEvent) {
-                            if (item != null) {
-                                deployment.client?.startWorkspace(item.workspace)
-                                cs.launch { fetchWorkspaces() }
-                            }
-                        }
-                    }).applyToComponent { isEnabled = listOf(WorkspaceStatus.STOPPED, WorkspaceStatus.FAILED).contains(item?.workspace?.latestBuild?.status) }
-                        .gap(RightGap.SMALL)
-                    actionButton(object : DumbAwareAction(CoderGatewayBundle.message("gateway.connector.recent-connections.stop.button.tooltip"), "", CoderIcons.STOP) {
-                        override fun actionPerformed(e: AnActionEvent) {
-                            if (item != null) {
-                                deployment.client?.stopWorkspace(item.workspace)
-                                cs.launch { fetchWorkspaces() }
-                            }
-                        }
-                    }).applyToComponent { isEnabled = item?.workspace?.latestBuild?.status == WorkspaceStatus.RUNNING }
-                        .gap(RightGap.SMALL)
-                    actionButton(object : DumbAwareAction(CoderGatewayBundle.message("gateway.connector.recent-connections.terminal.button.tooltip"), "", CoderIcons.OPEN_TERMINAL) {
-                        override fun actionPerformed(e: AnActionEvent) {
-                            BrowserUtil.browse(connections[0].webTerminalLink ?: "")
-                        }
-                    })
-                }.topGap(TopGap.MEDIUM)
+                        val status =
+                            if (deploymentError != null) {
+                                Triple(UIUtil.getErrorForeground(), deploymentError, UIUtil.getBalloonErrorIcon())
+                            } else if (workspaceWithAgent != null) {
+                                val inLoadingState = listOf(WorkspaceStatus.STARTING, WorkspaceStatus.CANCELING, WorkspaceStatus.DELETING, WorkspaceStatus.STOPPING).contains(workspaceWithAgent.workspace.latestBuild.status)
 
-                connections.forEach { connectionDetails ->
-                    val product = IntelliJPlatformProduct.fromProductCode(connectionDetails.ideProductCode!!)!!
-                    row {
-                        icon(product.icon)
-                        cell(ActionLink(connectionDetails.projectPath!!) {
-                            CoderRemoteConnectionHandle().connect{ connectionDetails.toWorkspaceParams() }
-                            GatewayUI.getInstance().reset()
-                        })
-                        label("").resizableColumn().align(AlignX.FILL)
-                        label("Last opened: ${connectionDetails.lastOpened}").applyToComponent {
-                            foreground = JBUI.CurrentTheme.ContextHelp.FOREGROUND
-                            font = ComponentPanelBuilder.getCommentFont(font)
-                        }
-                        actionButton(object : DumbAwareAction(CoderGatewayBundle.message("gateway.connector.recent-connections.remove.button.tooltip"), "", CoderIcons.DELETE) {
-                            override fun actionPerformed(e: AnActionEvent) {
-                                recentConnectionsService.removeConnection(connectionDetails)
-                                updateRecentView()
+                                Triple(
+                                    workspaceWithAgent.status.statusColor(),
+                                    workspaceWithAgent.status.description,
+                                    if (inLoadingState) {
+                                        AnimatedIcon.Default()
+                                    } else {
+                                        null
+                                    },
+                                )
+                            } else {
+                                Triple(UIUtil.getContextHelpForeground(), "Querying workspace status...", AnimatedIcon.Default())
                             }
-                        })
+                        val gap =
+                            if (top) {
+                                top = false
+                                TopGap.NONE
+                            } else {
+                                TopGap.MEDIUM
+                            }
+                        row {
+                            label(workspaceName).applyToComponent {
+                                font = JBFont.h3().asBold()
+                            }.align(AlignX.LEFT).gap(RightGap.SMALL)
+                            label(deploymentURL).applyToComponent {
+                                foreground = UIUtil.getContextHelpForeground()
+                                font = ComponentPanelBuilder.getCommentFont(font)
+                            }
+                            label("").resizableColumn().align(AlignX.FILL)
+                        }.topGap(gap)
+
+                        val enableLinks = listOf(WorkspaceStatus.STOPPED, WorkspaceStatus.CANCELED, WorkspaceStatus.FAILED, WorkspaceStatus.STARTING, WorkspaceStatus.RUNNING).contains(workspaceWithAgent?.workspace?.latestBuild?.status)
+
+                        // We only display an API error on the first workspace rather than duplicating it on each workspace.
+                        if (deploymentError == null || showError) {
+                            row {
+                                status.third?.let {
+                                    icon(it)
+                                }
+                                label("<html><body style='width:350px;'>" + status.second + "</html>").applyToComponent {
+                                    foreground = status.first
+                                }
+                            }
+                        }
+
+                        connections.forEach { workspaceProjectIDE ->
+                            row {
+                                icon(workspaceProjectIDE.ideProduct.icon)
+                                if (enableLinks) {
+                                    cell(
+                                        ActionLink(workspaceProjectIDE.projectPathDisplay) {
+                                            withoutNull(deployment?.cli, workspaceWithAgent?.workspace) { cli, workspace ->
+                                                CoderRemoteConnectionHandle().connect {
+                                                    if (listOf(WorkspaceStatus.STOPPED, WorkspaceStatus.CANCELED, WorkspaceStatus.FAILED).contains(workspace.latestBuild.status)) {
+                                                        cli.startWorkspace(workspace.ownerName, workspace.name)
+                                                    }
+                                                    workspaceProjectIDE
+                                                }
+                                                GatewayUI.getInstance().reset()
+                                            }
+                                        },
+                                    )
+                                } else {
+                                    label(workspaceProjectIDE.projectPathDisplay).applyToComponent {
+                                        foreground = Color.GRAY
+                                    }
+                                }
+                                label(workspaceProjectIDE.name.replace("$workspaceName.", "")).resizableColumn()
+                                label(workspaceProjectIDE.ideName).applyToComponent {
+                                    foreground = JBUI.CurrentTheme.ContextHelp.FOREGROUND
+                                    font = ComponentPanelBuilder.getCommentFont(font)
+                                }
+                                label(workspaceProjectIDE.lastOpened.toString()).applyToComponent {
+                                    foreground = JBUI.CurrentTheme.ContextHelp.FOREGROUND
+                                    font = ComponentPanelBuilder.getCommentFont(font)
+                                }
+                                actionButton(
+                                    object : DumbAwareAction(
+                                        CoderGatewayBundle.message("gateway.connector.recent-connections.remove.button.tooltip"),
+                                        "",
+                                        CoderIcons.DELETE,
+                                    ) {
+                                        override fun actionPerformed(e: AnActionEvent) {
+                                            recentConnectionsService.removeConnection(workspaceProjectIDE.toRecentWorkspaceConnection())
+                                            updateRecentView()
+                                        }
+                                    },
+                                )
+                            }
+                        }
                     }
                 }
+            }.apply {
+                background = WelcomeScreenUIManager.getMainAssociatedComponentBackground()
+                border = JBUI.Borders.empty(12, 0, 12, 12)
             }
-        }.apply {
-            background = WelcomeScreenUIManager.getMainAssociatedComponentBackground()
-            border = JBUI.Borders.empty(12, 0, 12, 12)
-        }
     }
+
+    /**
+     * Get valid connections grouped by deployment and workspace name.  The
+     * workspace name will be in the form `owner/workspace.agent`, without the agent
+     * name, or just `workspace`, if the connection predates when we added owner
+     * information, in which case it belongs to the current user.
+     */
+    private fun getConnectionsByDeployment(filter: Boolean): Map<String, Map<String, List<WorkspaceProjectIDE>>> = recentConnectionsService.getAllRecentConnections()
+        // Validate and parse connections.
+        .mapNotNull {
+            try {
+                it.toWorkspaceProjectIDE()
+            } catch (e: Exception) {
+                logger.warn("Removing invalid recent connection $it", e)
+                recentConnectionsService.removeConnection(it)
+                null
+            }
+        }
+        .filter { !filter || matchesFilter(it) }
+        // Group by the deployment.
+        .groupBy { it.deploymentURL.toString() }
+        // Group the connections in each deployment by workspace.
+        .mapValues { (_, connections) ->
+            connections
+                .groupBy { it.name.split(".", limit = 2).first() }
+        }
 
     /**
      * Return true if the connection matches the current filter.
      */
-    private fun matchesFilter(connection: RecentWorkspaceConnection): Boolean {
-        return filterString.isNullOrBlank()
-                || connection.coderWorkspaceHostname?.lowercase(Locale.getDefault())?.contains(filterString!!) == true
-                || connection.projectPath?.lowercase(Locale.getDefault())?.contains(filterString!!) == true
+    private fun matchesFilter(connection: WorkspaceProjectIDE): Boolean = filterString.let {
+        it.isNullOrBlank() ||
+            connection.hostname.lowercase(Locale.getDefault()).contains(it) ||
+            connection.projectPath.lowercase(Locale.getDefault()).contains(it)
     }
 
     /**
      * Start polling for workspaces if not already started.
      */
     private fun triggerWorkspacePolling() {
-        deployments = recentConnectionsService.getAllRecentConnections()
-            .mapNotNull { it.configDirectory }.toSet()
-            .associateWith { dir ->
-                deployments[dir] ?: try {
-                    val url = Path.of(dir).resolve("url").toFile().readText()
-                    val token = Path.of(dir).resolve("session").toFile().readText()
-                    DeploymentInfo(CoderRestClient(url.toURL(), token))
-                } catch (e: Exception) {
-                    logger.error("Unable to create client from $dir", e)
-                    DeploymentInfo(error = "Error trying to read $dir: ${e.message}")
-                }
-            }
-
         if (poller?.isActive == true) {
             logger.info("Refusing to start already-started poller")
             return
         }
 
         logger.info("Starting poll loop")
-        poller = cs.launch {
-            while (isActive) {
-                if (recentWorkspacesContentPanel.isShowing) {
-                    fetchWorkspaces()
-                } else {
-                    logger.info("View not visible; aborting poll")
-                    poller?.cancel()
+        poller =
+            cs.launch(ModalityState.current().asContextElement()) {
+                while (isActive) {
+                    if (recentWorkspacesContentPanel.isShowing) {
+                        logger.info("View still visible; fetching workspaces")
+                        fetchWorkspaces()
+                    } else {
+                        logger.info("View not visible; aborting poll")
+                        poller?.cancel()
+                    }
+                    delay(5000)
                 }
-                delay(5000)
             }
-        }
     }
 
     /**
@@ -291,18 +348,67 @@ class CoderGatewayRecentWorkspaceConnectionsView(private val setContentCallback:
      */
     private suspend fun fetchWorkspaces() {
         withContext(Dispatchers.IO) {
-            deployments.values
-                .filter { it.error == null && it.client != null}
-                .forEach { deployment ->
-                    val url = deployment.client!!.url
-                    try {
-                        deployment.items = deployment.client!!
-                            .workspaces().flatMap { it.toAgentList() }
-                    } catch (e: Exception) {
-                        logger.error("Failed to fetch workspaces from $url", e)
-                        deployment.error = e.message ?: "Request failed without further details"
+            val connectionsByDeployment = getConnectionsByDeployment(false)
+            connectionsByDeployment.forEach { (deploymentURL, connectionsByWorkspace) ->
+                val deployment = deployments.getOrPut(deploymentURL) { DeploymentInfo() }
+                try {
+                    val client = deployment.client
+                        ?: CoderRestClientService(
+                            deploymentURL.toURL(),
+                            settings.token(deploymentURL.toURL())?.first,
+                        )
+
+                    if (client.token == null && settings.requireTokenAuth) {
+                        throw Exception("Unable to make request; token was not found in CLI config.")
                     }
+
+                    val cli = ensureCLI(
+                        deploymentURL.toURL(),
+                        client.buildInfo().version,
+                        settings,
+                    )
+
+                    // We only need to log the cli in if we have token-based auth.
+                    // Otherwise, we assume it is set up in the same way the plugin
+                    // is with mTLS.
+                    if (client.token != null) {
+                        cli.login(client.token)
+                    }
+
+                    // This is purely to populate the current user, which is
+                    // used to match workspaces that were not recorded with owner
+                    // information.
+                    val me = client.authenticate().username
+
+                    // Delete connections that have no workspace.
+                    // TODO: Deletion without confirmation seems sketchy.
+                    val items = client.workspaces().flatMap { it.toAgentList() }
+                    connectionsByWorkspace.forEach { (name, connections) ->
+                        if (items.firstOrNull {
+                                it.workspace.ownerName + "/" + it.workspace.name == name ||
+                                    (it.workspace.ownerName == me && it.workspace.name == name)
+                            } == null
+                        ) {
+                            logger.info("Removing recent connections for deleted workspace $name (found ${connections.size})")
+                            connections.forEach { recentConnectionsService.removeConnection(it.toRecentWorkspaceConnection()) }
+                        }
+                    }
+
+                    deployment.client = client
+                    deployment.cli = cli
+                    deployment.items = items
+                    deployment.error = null
+                } catch (e: Exception) {
+                    val msg = humanizeConnectionError(deploymentURL.toURL(), settings.requireTokenAuth, e)
+                    deployment.client = null
+                    deployment.items = null
+                    deployment.error = msg
+                    logger.error(msg, e)
+                    // TODO: Ask for a token and reconfigure the CLI.
+                    // if (e is APIResponseException && e.isUnauthorized && settings.requireTokenAuth) {
+                    // }
                 }
+            }
         }
         withContext(Dispatchers.Main) {
             updateContentView()
@@ -313,9 +419,10 @@ class CoderGatewayRecentWorkspaceConnectionsView(private val setContentCallback:
     // check for visibility if you want to avoid work while the panel is not
     // displaying.
     override fun dispose() {
-        logger.info("Disposing recent view")
         cs.cancel()
         poller?.cancel()
+        jobs.forEach { it.value.cancel() }
+        jobs.clear()
     }
 
     companion object {

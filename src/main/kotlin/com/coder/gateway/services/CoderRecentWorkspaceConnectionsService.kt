@@ -9,9 +9,11 @@ import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
 import com.intellij.openapi.diagnostic.Logger
 
-
 @Service(Service.Level.APP)
-@State(name = "CoderRecentWorkspaceConnections", storages = [Storage("coder-recent-workspace-connections.xml", roamingType = RoamingType.DISABLED, exportable = true)])
+@State(
+    name = "CoderRecentWorkspaceConnections",
+    storages = [Storage("coder-recent-workspace-connections.xml", roamingType = RoamingType.DISABLED, exportable = true)],
+)
 class CoderRecentWorkspaceConnectionsService : PersistentStateComponent<RecentWorkspaceConnectionState> {
     private var myState = RecentWorkspaceConnectionState()
 
@@ -35,4 +37,3 @@ class CoderRecentWorkspaceConnectionsService : PersistentStateComponent<RecentWo
         val logger = Logger.getInstance(CoderRecentWorkspaceConnectionsService::class.java.simpleName)
     }
 }
-

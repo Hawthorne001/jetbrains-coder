@@ -1,14 +1,17 @@
 package com.coder.gateway.sdk.v2.models
 
-import com.google.gson.annotations.SerializedName
+import com.squareup.moshi.Json
+import com.squareup.moshi.JsonClass
 
-data class Validation (
-    @SerializedName("field") val field: String,
-    @SerializedName("detail") val detail: String,
+@JsonClass(generateAdapter = true)
+data class Validation(
+    @Json(name = "field") val field: String,
+    @Json(name = "detail") val detail: String,
 )
 
-data class Response (
-    @SerializedName("message") val message: String,
-    @SerializedName("detail") val detail: String,
-    @SerializedName("validations") val validations: List<Validation> = emptyList(),
+@JsonClass(generateAdapter = true)
+data class Response(
+    @Json(name = "message") val message: String,
+    @Json(name = "detail") val detail: String,
+    @Json(name = "validations") val validations: List<Validation> = emptyList(),
 )

@@ -2,56 +2,38 @@ package com.coder.gateway.sdk.v2.models
 
 import com.coder.gateway.util.Arch
 import com.coder.gateway.util.OS
-import com.google.gson.annotations.SerializedName
-import java.time.Instant
-import java.util.*
+import com.squareup.moshi.Json
+import com.squareup.moshi.JsonClass
+import java.util.UUID
 
+@JsonClass(generateAdapter = true)
 data class WorkspaceAgent(
-    @SerializedName("id") val id: UUID,
-    @SerializedName("created_at") val createdAt: Instant,
-    @SerializedName("updated_at") val updatedAt: Instant,
-    @SerializedName("first_connected_at") val firstConnectedAt: Instant?,
-    @SerializedName("last_connected_at") val lastConnectedAt: Instant?,
-    @SerializedName("disconnected_at") val disconnectedAt: Instant?,
-    @SerializedName("status") val status: WorkspaceAgentStatus,
-    @SerializedName("name") val name: String,
-    @SerializedName("resource_id") val resourceID: UUID,
-    @SerializedName("instance_id") val instanceID: String?,
-    @SerializedName("architecture") val architecture: Arch?,
-    @SerializedName("environment_variables") val envVariables: Map<String, String>,
-    @SerializedName("operating_system") val operatingSystem: OS?,
-    @SerializedName("startup_script") val startupScript: String?,
-    @SerializedName("directory") val directory: String?,
-    @SerializedName("expanded_directory") val expandedDirectory: String?,
-    @SerializedName("version") val version: String,
-    @SerializedName("apps") val apps: List<WorkspaceApp>,
-    @SerializedName("latency") val derpLatency: Map<String, DERPRegion>?,
-    @SerializedName("connection_timeout_seconds") val connectionTimeoutSeconds: Int,
-    @SerializedName("troubleshooting_url") val troubleshootingURL: String,
-    @SerializedName("lifecycle_state") val lifecycleState: WorkspaceAgentLifecycleState,
-    @SerializedName("login_before_ready") val loginBeforeReady: Boolean?,
+    @Json(name = "id") val id: UUID,
+    @Json(name = "status") val status: WorkspaceAgentStatus,
+    @Json(name = "name") val name: String,
+    @Json(name = "architecture") val architecture: Arch?,
+    @Json(name = "operating_system") val operatingSystem: OS?,
+    @Json(name = "directory") val directory: String?,
+    @Json(name = "expanded_directory") val expandedDirectory: String?,
+    @Json(name = "lifecycle_state") val lifecycleState: WorkspaceAgentLifecycleState,
+    @Json(name = "login_before_ready") val loginBeforeReady: Boolean?,
 )
 
 enum class WorkspaceAgentStatus {
-    @SerializedName("connecting") CONNECTING,
-    @SerializedName("connected") CONNECTED,
-    @SerializedName("disconnected") DISCONNECTED,
-    @SerializedName("timeout") TIMEOUT
+    @Json(name = "connecting") CONNECTING,
+    @Json(name = "connected") CONNECTED,
+    @Json(name = "disconnected") DISCONNECTED,
+    @Json(name = "timeout") TIMEOUT,
 }
 
 enum class WorkspaceAgentLifecycleState {
-    @SerializedName("created") CREATED,
-    @SerializedName("starting") STARTING,
-    @SerializedName("start_timeout") START_TIMEOUT,
-    @SerializedName("start_error") START_ERROR,
-    @SerializedName("ready") READY,
-    @SerializedName("shutting_down") SHUTTING_DOWN,
-    @SerializedName("shutdown_timeout") SHUTDOWN_TIMEOUT,
-    @SerializedName("shutdown_error") SHUTDOWN_ERROR,
-    @SerializedName("off") OFF,
+    @Json(name = "created") CREATED,
+    @Json(name = "starting") STARTING,
+    @Json(name = "start_timeout") START_TIMEOUT,
+    @Json(name = "start_error") START_ERROR,
+    @Json(name = "ready") READY,
+    @Json(name = "shutting_down") SHUTTING_DOWN,
+    @Json(name = "shutdown_timeout") SHUTDOWN_TIMEOUT,
+    @Json(name = "shutdown_error") SHUTDOWN_ERROR,
+    @Json(name = "off") OFF,
 }
-
-data class DERPRegion(
-    @SerializedName("preferred") val preferred: Boolean,
-    @SerializedName("latency_ms") val latencyMillis: Double,
-)

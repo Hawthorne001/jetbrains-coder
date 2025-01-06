@@ -10,16 +10,13 @@ import javax.swing.Icon
 // cannot be connected to.
 data class WorkspaceAgentListModel(
     val workspace: Workspace,
-
     // If this is missing, assume the workspace is off or has no agents.
     val agent: WorkspaceAgent? = null,
-
-    // The icon to display on the row.
+    // The icon of the template from which this workspace was created.
     var icon: Icon? = null,
-
     // The combined status of the workspace and agent to display on the row.
     val status: WorkspaceAndAgentStatus = WorkspaceAndAgentStatus.from(workspace, agent),
-
-    // The combined `workspace.agent` name to display on the row.
-    val name: String = if (agent != null) "${workspace.name}.${agent.name}" else workspace.name
+    // The combined `workspace.agent` name to display on the row.  Users can have workspaces with the same name, so it
+    // must not be used as a unique identifier.
+    val name: String = if (agent != null) "${workspace.name}.${agent.name}" else workspace.name,
 )
