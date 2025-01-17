@@ -1,40 +1,33 @@
 package com.coder.gateway.sdk.v2.models
 
 import com.coder.gateway.models.WorkspaceAgentListModel
-import com.google.gson.annotations.SerializedName
-import java.time.Instant
-import java.util.*
+import com.squareup.moshi.Json
+import com.squareup.moshi.JsonClass
+import java.util.UUID
 
 /**
- * Represents a deployment of a template. It references a specific version and can be updated.
+ * Represents a deployment of a template. It references a specific version and
+ * can be updated.
  */
+@JsonClass(generateAdapter = true)
 data class Workspace(
-    @SerializedName("id") val id: UUID,
-    @SerializedName("created_at") val createdAt: Instant,
-    @SerializedName("updated_at") val updatedAt: Instant,
-    @SerializedName("owner_id") val ownerID: UUID,
-    @SerializedName("owner_name") val ownerName: String,
-    @SerializedName("template_id") val templateID: UUID,
-    @SerializedName("template_name") val templateName: String,
-    @SerializedName("template_display_name") val templateDisplayName: String,
-    @SerializedName("template_icon") val templateIcon: String,
-    @SerializedName("template_allow_user_cancel_workspace_jobs") val templateAllowUserCancelWorkspaceJobs: Boolean,
-    @SerializedName("latest_build") val latestBuild: WorkspaceBuild,
-    @SerializedName("outdated") val outdated: Boolean,
-    @SerializedName("name") val name: String,
-    @SerializedName("autostart_schedule") val autostartSchedule: String?,
-    @SerializedName("ttl_ms") val ttlMillis: Long?,
-    @SerializedName("last_used_at") val lastUsedAt: Instant,
+    @Json(name = "id") val id: UUID,
+    @Json(name = "template_id") val templateID: UUID,
+    @Json(name = "template_name") val templateName: String,
+    @Json(name = "template_display_name") val templateDisplayName: String,
+    @Json(name = "template_icon") val templateIcon: String,
+    @Json(name = "latest_build") val latestBuild: WorkspaceBuild,
+    @Json(name = "outdated") val outdated: Boolean,
+    @Json(name = "name") val name: String,
+    @Json(name = "owner_name") val ownerName: String,
 )
 
 /**
  * Return a list of agents combined with this workspace to display in the list.
  * If the workspace has no agents, return just itself with a null agent.
  */
-fun Workspace.toAgentList(resources: List<WorkspaceResource> = this.latestBuild.resources): List<WorkspaceAgentListModel> {
-    return resources.filter { it.agents != null }.flatMap { it.agents!! }.map { agent ->
-        WorkspaceAgentListModel(this, agent)
-    }.ifEmpty {
-        listOf(WorkspaceAgentListModel(this))
-    }
+fun Workspace.toAgentList(resources: List<WorkspaceResource> = this.latestBuild.resources): List<WorkspaceAgentListModel> = resources.filter { it.agents != null }.flatMap { it.agents!! }.map { agent ->
+    WorkspaceAgentListModel(this, agent)
+}.ifEmpty {
+    listOf(WorkspaceAgentListModel(this))
 }

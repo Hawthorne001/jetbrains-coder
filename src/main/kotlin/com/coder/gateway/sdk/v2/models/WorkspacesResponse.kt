@@ -1,8 +1,9 @@
 package com.coder.gateway.sdk.v2.models
 
-import com.google.gson.annotations.SerializedName
+import com.squareup.moshi.Json
+import com.squareup.moshi.JsonClass
 
+@JsonClass(generateAdapter = true)
 data class WorkspacesResponse(
-    @SerializedName("workspaces") val workspaces: List<Workspace>,
-    @SerializedName("count") val count: Int
+    @Json(name = "workspaces") val workspaces: List<Workspace>,
 )

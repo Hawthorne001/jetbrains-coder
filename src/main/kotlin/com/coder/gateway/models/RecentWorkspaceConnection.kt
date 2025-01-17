@@ -3,6 +3,12 @@ package com.coder.gateway.models
 import com.intellij.openapi.components.BaseState
 import com.intellij.util.xmlb.annotations.Attribute
 
+/**
+ * A workspace, project, and IDE.
+ *
+ * This is read from a file so values could be missing, and names must not be
+ * changed to maintain backwards compatibility.
+ */
 class RecentWorkspaceConnection(
     coderWorkspaceHostname: String? = null,
     projectPath: String? = null,
@@ -11,30 +17,47 @@ class RecentWorkspaceConnection(
     ideBuildNumber: String? = null,
     downloadSource: String? = null,
     idePathOnHost: String? = null,
+    // webTerminalLink and configDirectory are deprecated by deploymentURL.
     webTerminalLink: String? = null,
     configDirectory: String? = null,
     name: String? = null,
-) : BaseState(), Comparable<RecentWorkspaceConnection> {
+    deploymentURL: String? = null,
+) : BaseState(),
+    Comparable<RecentWorkspaceConnection> {
     @get:Attribute
     var coderWorkspaceHostname by string()
+
     @get:Attribute
     var projectPath by string()
+
     @get:Attribute
     var lastOpened by string()
+
     @get:Attribute
     var ideProductCode by string()
+
     @get:Attribute
     var ideBuildNumber by string()
+
     @get:Attribute
     var downloadSource by string()
+
     @get:Attribute
     var idePathOnHost by string()
+
+    @Deprecated("Derive from deploymentURL instead.")
     @get:Attribute
     var webTerminalLink by string()
+
+    @Deprecated("Derive from deploymentURL instead.")
     @get:Attribute
     var configDirectory by string()
+
     @get:Attribute
     var name by string()
+
+    @get:Attribute
+    var deploymentURL by string()
 
     init {
         this.coderWorkspaceHostname = coderWorkspaceHostname
@@ -44,8 +67,11 @@ class RecentWorkspaceConnection(
         this.ideBuildNumber = ideBuildNumber
         this.downloadSource = downloadSource
         this.idePathOnHost = idePathOnHost
+        @Suppress("DEPRECATION")
         this.webTerminalLink = webTerminalLink
+        @Suppress("DEPRECATION")
         this.configDirectory = configDirectory
+        this.deploymentURL = deploymentURL
         this.name = name
     }
 
@@ -60,9 +86,6 @@ class RecentWorkspaceConnection(
         if (projectPath != other.projectPath) return false
         if (ideProductCode != other.ideProductCode) return false
         if (ideBuildNumber != other.ideBuildNumber) return false
-        if (downloadSource != other.downloadSource) return false
-        if (idePathOnHost != other.idePathOnHost) return false
-        if (webTerminalLink != other.webTerminalLink) return false
 
         return true
     }
@@ -73,9 +96,6 @@ class RecentWorkspaceConnection(
         result = 31 * result + (projectPath?.hashCode() ?: 0)
         result = 31 * result + (ideProductCode?.hashCode() ?: 0)
         result = 31 * result + (ideBuildNumber?.hashCode() ?: 0)
-        result = 31 * result + (downloadSource?.hashCode() ?: 0)
-        result = 31 * result + (idePathOnHost?.hashCode() ?: 0)
-        result = 31 * result + (webTerminalLink?.hashCode() ?: 0)
 
         return result
     }
@@ -92,15 +112,6 @@ class RecentWorkspaceConnection(
 
         val l = other.ideBuildNumber?.let { ideBuildNumber?.compareTo(it) }
         if (l != null && l != 0) return l
-
-        val m = other.downloadSource?.let { downloadSource?.compareTo(it) }
-        if (m != null && m != 0) return m
-
-        val n = other.idePathOnHost?.let { idePathOnHost?.compareTo(it) }
-        if (n != null && n != 0) return n
-
-        val o = other.webTerminalLink?.let { webTerminalLink?.compareTo(it) }
-        if (o != null && o != 0) return o
 
         return 0
     }

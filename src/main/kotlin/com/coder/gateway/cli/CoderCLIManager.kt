@@ -3,8 +3,11 @@ package com.coder.gateway.cli
 import com.coder.gateway.cli.ex.MissingVersionException
 import com.coder.gateway.cli.ex.ResponseException
 import com.coder.gateway.cli.ex.SSHConfigFormatException
-import com.coder.gateway.services.CoderSettingsState
+import com.coder.gateway.sdk.v2.models.User
+import com.coder.gateway.sdk.v2.models.Workspace
+import com.coder.gateway.sdk.v2.models.WorkspaceAgent
 import com.coder.gateway.settings.CoderSettings
+import com.coder.gateway.settings.CoderSettingsState
 import com.coder.gateway.util.CoderHostnameVerifier
 import com.coder.gateway.util.InvalidVersionException
 import com.coder.gateway.util.OS
@@ -16,11 +19,13 @@ import com.coder.gateway.util.getHeaders
 import com.coder.gateway.util.getOS
 import com.coder.gateway.util.safeHost
 import com.coder.gateway.util.sha1
-import com.google.gson.Gson
-import com.google.gson.JsonSyntaxException
 import com.intellij.openapi.diagnostic.Logger
-import com.intellij.openapi.progress.ProgressIndicator
+import com.squareup.moshi.Json
+import com.squareup.moshi.JsonClass
+import com.squareup.moshi.JsonDataException
+import com.squareup.moshi.Moshi
 import org.zeroturnaround.exec.ProcessExecutor
+import java.io.EOFException
 import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.net.ConnectException
@@ -31,6 +36,14 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.zip.GZIPInputStream
 import javax.net.ssl.HttpsURLConnection
+
+/**
+ * Version output from the CLI's version command.
+ */
+@JsonClass(generateAdapter = true)
+internal data class Version(
+    @Json(name = "version") val version: String,
+)
 
 /**
  * Do as much as possible to get a valid, up-to-date CLI.
@@ -48,7 +61,7 @@ fun ensureCLI(
     deploymentURL: URL,
     buildVersion: String,
     settings: CoderSettings,
-    indicator: ProgressIndicator? = null,
+    indicator: ((t: String) -> Unit)? = null,
 ): CoderCLIManager {
     val cli = CoderCLIManager(deploymentURL, settings)
 
@@ -64,7 +77,7 @@ fun ensureCLI(
 
     // If downloads are enabled download the new version.
     if (settings.enableDownloads) {
-        indicator?.text = "Downloading Coder CLI..."
+        indicator?.invoke("Downloading Coder CLI...")
         try {
             cli.download()
             return cli
@@ -86,7 +99,7 @@ fun ensureCLI(
     }
 
     if (settings.enableDownloads) {
-        indicator?.text = "Downloading Coder CLI..."
+        indicator?.invoke("Downloading Coder CLI...")
         dataCLI.download()
         return dataCLI
     }
@@ -95,6 +108,14 @@ fun ensureCLI(
     // working binary and the binary directory does not.
     return if (cliMatches == null && dataCLIMatches != null) dataCLI else cli
 }
+
+/**
+ * The supported features of the CLI.
+ */
+data class Features(
+    val disableAutostart: Boolean = false,
+    val reportWorkspaceUsage: Boolean = false,
+)
 
 /**
  * Manage the CLI for a single deployment.
@@ -116,7 +137,7 @@ class CoderCLIManager(
      * Download the CLI from the deployment if necessary.
      */
     fun download(): Boolean {
-        val etag = getBinaryETag()
+        val eTag = getBinaryETag()
         val conn = remoteBinaryURL.openConnection() as HttpURLConnection
         if (settings.headerCommand.isNotBlank()) {
             val headersFromHeaderCommand = getHeaders(deploymentURL, settings.headerCommand)
@@ -124,9 +145,9 @@ class CoderCLIManager(
                 conn.setRequestProperty(key, value)
             }
         }
-        if (etag != null) {
-            logger.info("Found existing binary at $localBinaryPath; calculated hash as $etag")
-            conn.setRequestProperty("If-None-Match", "\"$etag\"")
+        if (eTag != null) {
+            logger.info("Found existing binary at $localBinaryPath; calculated hash as $eTag")
+            conn.setRequestProperty("If-None-Match", "\"$eTag\"")
         }
         conn.setRequestProperty("Accept-Encoding", "gzip")
         if (conn is HttpsURLConnection) {
@@ -171,15 +192,13 @@ class CoderCLIManager(
     /**
      * Return the entity tag for the binary on disk, if any.
      */
-    private fun getBinaryETag(): String? {
-        return try {
-            sha1(FileInputStream(localBinaryPath.toFile()))
-        } catch (e: FileNotFoundException) {
-            null
-        } catch (e: Exception) {
-            logger.warn("Unable to calculate hash for $localBinaryPath", e)
-            null
-        }
+    private fun getBinaryETag(): String? = try {
+        sha1(FileInputStream(localBinaryPath.toFile()))
+    } catch (e: FileNotFoundException) {
+        null
+    } catch (e: Exception) {
+        logger.warn("Unable to calculate hash for $localBinaryPath", e)
+        null
     }
 
     /**
@@ -199,53 +218,104 @@ class CoderCLIManager(
 
     /**
      * Configure SSH to use this binary.
+     *
+     * This can take supported features for testing purposes only.
      */
-    fun configSsh(workspaceNames: List<String>) {
-        writeSSHConfig(modifySSHConfig(readSSHConfig(), workspaceNames))
+    fun configSsh(
+        workspacesAndAgents: Set<Pair<Workspace, WorkspaceAgent>>,
+        currentUser: User,
+        feats: Features = features,
+    ) {
+        logger.info("Configuring SSH config at ${settings.sshConfigPath}")
+        writeSSHConfig(modifySSHConfig(readSSHConfig(), workspacesAndAgents, feats, currentUser))
     }
 
     /**
      * Return the contents of the SSH config or null if it does not exist.
      */
-    private fun readSSHConfig(): String? {
-        return try {
-            settings.sshConfigPath.toFile().readText()
-        } catch (e: FileNotFoundException) {
-            null
-        }
+    private fun readSSHConfig(): String? = try {
+        settings.sshConfigPath.toFile().readText()
+    } catch (e: FileNotFoundException) {
+        null
     }
 
     /**
      * Given an existing SSH config modify it to add or remove the config for
      * this deployment and return the modified config or null if it does not
      * need to be modified.
+     *
+     * If features are not provided, calculate them based on the binary
+     * version.
      */
-    private fun modifySSHConfig(contents: String?, workspaceNames: List<String>): String? {
+    private fun modifySSHConfig(
+        contents: String?,
+        workspaceNames: Set<Pair<Workspace, WorkspaceAgent>>,
+        feats: Features,
+        currentUser: User,
+    ): String? {
         val host = deploymentURL.safeHost()
         val startBlock = "# --- START CODER JETBRAINS $host"
         val endBlock = "# --- END CODER JETBRAINS $host"
         val isRemoving = workspaceNames.isEmpty()
-        val proxyArgs = listOfNotNull(
-            escape(localBinaryPath.toString()),
-            "--global-config", escape(coderConfigPath.toString()),
-            if (settings.headerCommand.isNotBlank()) "--header-command" else null,
-            if (settings.headerCommand.isNotBlank()) escapeSubcommand(settings.headerCommand) else null,
-           "ssh", "--stdio")
-        val blockContent = workspaceNames.joinToString(
-            System.lineSeparator(),
-            startBlock + System.lineSeparator(),
-            System.lineSeparator() + endBlock,
-            transform = {
-                """
-                Host ${getHostName(deploymentURL, it)}
-                  ProxyCommand ${proxyArgs.joinToString(" ")} ${it}
-                  ConnectTimeout 0
-                  StrictHostKeyChecking no
-                  UserKnownHostsFile /dev/null
-                  LogLevel ERROR
-                  SetEnv CODER_SSH_SESSION_TYPE=JetBrains
-                """.trimIndent().replace("\n", System.lineSeparator())
-            })
+        val baseArgs =
+            listOfNotNull(
+                escape(localBinaryPath.toString()),
+                "--global-config",
+                escape(coderConfigPath.toString()),
+                // CODER_URL might be set, and it will override the URL file in
+                // the config directory, so override that here to make sure we
+                // always use the correct URL.
+                "--url",
+                escape(deploymentURL.toString()),
+                if (settings.headerCommand.isNotBlank()) "--header-command" else null,
+                if (settings.headerCommand.isNotBlank()) escapeSubcommand(settings.headerCommand) else null,
+                "ssh",
+                "--stdio",
+                if (settings.disableAutostart && feats.disableAutostart) "--disable-autostart" else null,
+            )
+        val proxyArgs = baseArgs + listOfNotNull(
+            if (settings.sshLogDirectory.isNotBlank()) "--log-dir" else null,
+            if (settings.sshLogDirectory.isNotBlank()) escape(settings.sshLogDirectory) else null,
+            if (feats.reportWorkspaceUsage) "--usage-app=jetbrains" else null,
+        )
+        val backgroundProxyArgs = baseArgs + listOfNotNull(if (feats.reportWorkspaceUsage) "--usage-app=disable" else null)
+        val extraConfig =
+            if (settings.sshConfigOptions.isNotBlank()) {
+                "\n" + settings.sshConfigOptions.prependIndent("  ")
+            } else {
+                ""
+            }
+        val blockContent =
+            workspaceNames.joinToString(
+                System.lineSeparator(),
+                startBlock + System.lineSeparator(),
+                System.lineSeparator() + endBlock,
+                transform = {
+                    """
+                    Host ${getHostName(deploymentURL, it.first, currentUser, it.second)}
+                      ProxyCommand ${proxyArgs.joinToString(" ")} ${getWorkspaceParts(it.first, it.second)}
+                      ConnectTimeout 0
+                      StrictHostKeyChecking no
+                      UserKnownHostsFile /dev/null
+                      LogLevel ERROR
+                      SetEnv CODER_SSH_SESSION_TYPE=JetBrains
+                    """.trimIndent()
+                        .plus(extraConfig)
+                        .plus("\n")
+                        .plus(
+                            """
+                            Host ${getBackgroundHostName(deploymentURL, it.first, currentUser, it.second)}
+                              ProxyCommand ${backgroundProxyArgs.joinToString(" ")} ${getWorkspaceParts(it.first, it.second)}
+                              ConnectTimeout 0
+                              StrictHostKeyChecking no
+                              UserKnownHostsFile /dev/null
+                              LogLevel ERROR
+                              SetEnv CODER_SSH_SESSION_TYPE=JetBrains
+                            """.trimIndent()
+                                .plus(extraConfig),
+                        ).replace("\n", System.lineSeparator())
+                },
+            )
 
         if (contents == null) {
             logger.info("No existing SSH config to modify")
@@ -262,10 +332,15 @@ class CoderCLIManager(
 
         if (start == null && end == null) {
             logger.info("Appending config block")
-            val toAppend = if (contents.isEmpty()) blockContent else listOf(
-                contents,
-                blockContent
-            ).joinToString(System.lineSeparator())
+            val toAppend =
+                if (contents.isEmpty()) {
+                    blockContent
+                } else {
+                    listOf(
+                        contents,
+                        blockContent,
+                    ).joinToString(System.lineSeparator())
+                }
             return toAppend + System.lineSeparator()
         }
 
@@ -287,7 +362,7 @@ class CoderCLIManager(
                 // front of the file otherwise the before and after lines would
                 // get joined.
                 if (start.range.first > 0) end.groupValues[1] else "",
-                contents.substring(end.range.last + 1)
+                contents.substring(end.range.last + 1),
             ).joinToString("")
         }
 
@@ -297,7 +372,7 @@ class CoderCLIManager(
             start.groupValues[1], // Leading newline(s).
             blockContent,
             end.groupValues[1], // Trailing newline(s).
-            contents.substring(end.range.last + 1)
+            contents.substring(end.range.last + 1),
         ).joinToString("")
     }
 
@@ -308,15 +383,12 @@ class CoderCLIManager(
         if (contents != null) {
             settings.sshConfigPath.parent.toFile().mkdirs()
             settings.sshConfigPath.toFile().writeText(contents)
+            // The Coder cli will *not* create the log directory.
+            if (settings.sshLogDirectory.isNotBlank()) {
+                Path.of(settings.sshLogDirectory).toFile().mkdirs()
+            }
         }
     }
-
-    /**
-     * Version output from the CLI's version command.
-     */
-    private data class Version(
-        val version: String,
-    )
 
     /**
      * Return the binary version.
@@ -325,11 +397,37 @@ class CoderCLIManager(
      */
     fun version(): SemVer {
         val raw = exec("version", "--output", "json")
-        val json = Gson().fromJson(raw, Version::class.java)
-        if (json?.version == null) {
+        try {
+            val json = Moshi.Builder().build().adapter(Version::class.java).fromJson(raw)
+            if (json?.version == null || json.version.isBlank()) {
+                throw MissingVersionException("No version found in output")
+            }
+            return SemVer.parse(json.version)
+        } catch (exception: JsonDataException) {
+            throw MissingVersionException("No version found in output")
+        } catch (exception: EOFException) {
             throw MissingVersionException("No version found in output")
         }
-        return SemVer.parse(json.version)
+    }
+
+    /**
+     * Like version(), but logs errors instead of throwing them.
+     */
+    private fun tryVersion(): SemVer? = try {
+        version()
+    } catch (e: Exception) {
+        when (e) {
+            is InvalidVersionException -> {
+                logger.info("Got invalid version from $localBinaryPath: ${e.message}")
+            }
+            else -> {
+                // An error here most likely means the CLI does not exist or
+                // it executed successfully but output no version which
+                // suggests it is not the right binary.
+                logger.info("Unable to determine $localBinaryPath version: ${e.message}")
+            }
+        }
+        null
     }
 
     /**
@@ -339,58 +437,105 @@ class CoderCLIManager(
      * version could not be parsed.
      */
     fun matchesVersion(rawBuildVersion: String): Boolean? {
-        val cliVersion = try {
-            version()
-        } catch (e: Exception) {
-            when (e) {
-                is JsonSyntaxException,
-                is InvalidVersionException -> {
-                    logger.info("Got invalid version from $localBinaryPath: ${e.message}")
-                    return null
-                }
-                else -> {
-                    // An error here most likely means the CLI does not exist or
-                    // it executed successfully but output no version which
-                    // suggests it is not the right binary.
-                    logger.info("Unable to determine $localBinaryPath version: ${e.message}")
-                    return null
-                }
+        val cliVersion = tryVersion() ?: return null
+        val buildVersion =
+            try {
+                SemVer.parse(rawBuildVersion)
+            } catch (e: InvalidVersionException) {
+                logger.info("Got invalid build version: $rawBuildVersion")
+                return null
             }
-        }
-
-        val buildVersion = try {
-            SemVer.parse(rawBuildVersion)
-        } catch (e: InvalidVersionException) {
-            logger.info("Got invalid build version: $rawBuildVersion")
-            return null
-        }
 
         val matches = cliVersion == buildVersion
         logger.info("$localBinaryPath version $cliVersion matches $buildVersion: $matches")
         return matches
     }
 
+    /**
+     * Start a workspace.
+     *
+     * Throws if the command execution fails.
+     */
+    fun startWorkspace(workspaceOwner: String, workspaceName: String): String {
+        return exec(
+            "--global-config",
+            coderConfigPath.toString(),
+            "start",
+            "--yes",
+            workspaceOwner+"/"+workspaceName,
+        )
+    }
+
     private fun exec(vararg args: String): String {
-        val stdout = ProcessExecutor()
-            .command(localBinaryPath.toString(), *args)
-            .environment("CODER_HEADER_COMMAND", settings.headerCommand)
-            .exitValues(0)
-            .readOutput(true)
-            .execute()
-            .outputUTF8()
+        val stdout =
+            ProcessExecutor()
+                .command(localBinaryPath.toString(), *args)
+                .environment("CODER_HEADER_COMMAND", settings.headerCommand)
+                .exitValues(0)
+                .readOutput(true)
+                .execute()
+                .outputUTF8()
         val redactedArgs = listOf(*args).joinToString(" ").replace(tokenRegex, "--token <redacted>")
         logger.info("`$localBinaryPath $redactedArgs`: $stdout")
         return stdout
     }
+
+    val features: Features
+        get() {
+            val version = tryVersion()
+            return if (version == null) {
+                Features()
+            } else {
+                Features(
+                    disableAutostart = version >= SemVer(2, 5, 0),
+                    reportWorkspaceUsage = version >= SemVer(2, 13, 0),
+                )
+            }
+        }
 
     companion object {
         val logger = Logger.getInstance(CoderCLIManager::class.java.simpleName)
 
         private val tokenRegex = "--token [^ ]+".toRegex()
 
+        /**
+         * This function returns the ssh host name generated for connecting to the workspace.
+         */
         @JvmStatic
-        fun getHostName(url: URL, workspaceName: String): String {
-            return "coder-jetbrains--${workspaceName}--${url.safeHost()}"
-        }
+        fun getHostName(
+            url: URL,
+            workspace: Workspace,
+            currentUser: User,
+            agent: WorkspaceAgent,
+        ): String =
+            // For a user's own workspace, we use the old syntax without a username for backwards compatibility,
+            // since the user might have recent connections that still use the old syntax.
+            if (currentUser.username == workspace.ownerName) {
+                "coder-jetbrains--${workspace.name}.${agent.name}--${url.safeHost()}"
+            } else {
+                "coder-jetbrains--${workspace.ownerName}--${workspace.name}.${agent.name}--${url.safeHost()}"
+            }
+
+        fun getBackgroundHostName(
+            url: URL,
+            workspace: Workspace,
+            currentUser: User,
+            agent: WorkspaceAgent,
+        ): String = getHostName(url, workspace, currentUser, agent) + "--bg"
+
+        /**
+         * This function returns the identifier for the workspace to pass to the
+         * coder ssh proxy command.
+         */
+        @JvmStatic
+        fun getWorkspaceParts(
+            workspace: Workspace,
+            agent: WorkspaceAgent,
+        ): String = "${workspace.ownerName}/${workspace.name}.${agent.name}"
+
+        @JvmStatic
+        fun getBackgroundHostName(
+            hostname: String,
+        ): String = hostname + "--bg"
     }
 }
